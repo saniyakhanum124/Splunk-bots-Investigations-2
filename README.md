@@ -32,13 +32,36 @@ This machine was running a sophisticated multi-module malware that simultaneousl
 - 🗺️ **Mapped internal infrastructure** via DNS — targeting Splunk SIEM (2,445 queries), AV server, and proxy
 ---
  
-## Files in This Folder
+## Repository Structure
  
-| File | Description |
+```
+├── README.md
+├── investigation/
+│   └── Investigation-2-Compromised-Host.md
+├── queries/
+│   └── SPL_queries.md
+├── report/
+│   └── Investigation_2_Report_Final_v2.pdf
+└── screenshots/
+    ├── 01_no_sysmon_scope_check.png
+    ├── 02_bits_download_crx3.png
+    ├── 03_primary_c2_beacon_track_contently.png
+    ├── 04_beacon_interval_timediff.png
+    ├── 05_secondary_beacon_ipinfo.png
+    ├── 06_browser_fingerprint_servicemax.png
+    ├── 07_ad_network_traffic_stats.png
+    ├── 08_dns_recon_top_queries.png
+    ├── 09_dns_splunk_froth_ly_resolution.png
+    ├── 10_smb_broadcast_discovery.png
+    └── 11_btun_l_lateral_movement_ruled_out.png
+```
+ 
+| Folder / File | Description |
 |---|---|
 | `README.md` | This file — quick overview |
-| `Investigation_2_Report.md` | Full detailed report with all findings |
-| `SPL_Queries_Investigation_2.spl` | All SPL queries used, with comments |
+| `investigation/Investigation-2-Compromised-Host.md` | Full detailed report with all findings |
+| `queries/SPL_queries.md` | All SPL queries used, with comments |
+| `report/Investigation_2_Report_Final_v2.pdf` | Original PDF version of the full report |
 | `screenshots/` | Evidence screenshots from Splunk |
  
 ---
