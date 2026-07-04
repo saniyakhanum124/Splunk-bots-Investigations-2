@@ -1,0 +1,282 @@
+// ══════════════════════════════════════════════════════════════════
+// INVESTIGATION 2 — Compromised Internal Machine Analysis
+// Target: 192.168.3.130 | Dataset: BOTS v3 | Tool: Splunk Enterprise
+// Author: Saniya | github.com/saniyakhanum124
+// ══════════════════════════════════════════════════════════════════
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 1 — HOST IDENTIFICATION
+// ─────────────────────────────────────────────────────────────────
+
+// Q1.1 — Check which sourcetypes are available for this host
+// WHY: Determines what investigation is possible.
+//      No Sysmon = no process-level evidence, rely on network logs only.
+// RESULT: 10 sourcetypes. No XmlWinEventLog or Sysmon confirmed.
+index=botsv3 src_ip=192.168.3.130 OR dest_ip=192.168.3.130
+| stats count by sourcetype
+| sort -count
+
+
+// Q1.2 — Machine fingerprinting: hostname, MAC, user agents
+// WHY: MAC prefix reveals hardware type (VMware = virtual machine).
+//      User agents reveal every application making HTTP requests,
+//      including malware (python-requests, BITS).
+// RESULT: MAC 00:0C:29 = VMware VM. Windows 10 (NT 10.0 in UA).
+//         python-requests/2.18.4 and Microsoft BITS/7.8 flagged.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+| stats values(src_host) as hostname,
+        values(src_mac) as mac_address,
+        values(http_user_agent) as user_agents
+  by src_ip
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 2 — MAP ALL EXTERNAL DESTINATIONS
+// ─────────────────────────────────────────────────────────────────
+
+// Q2.1 — All destinations with traffic pattern analysis
+// WHY: dc(uri_path) = distinct count of unique paths.
+//      dc=1 with high count = beaconing (same URL hit repeatedly).
+//      dc=count with high count = scraping (every request different page).
+//      Normal workstation contacts 20-40 destinations per day.
+//      235 unique destinations is immediately suspicious.
+// RESULT: track.contently.com: 41 POSTs, dc=1 → BEACON.
+//         visitcalifornia.com: 146 GETs, dc=146 → SCRAPING.
+//         12+ ad networks → AD FRAUD.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+| stats count, values(http_method) as methods,
+        dc(uri_path) as unique_paths
+  by dest_ip, site
+| sort -count
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 3 — C2 BEACON ANALYSIS (Finding 2)
+// ─────────────────────────────────────────────────────────────────
+
+// Q3.1 — Inspect the suspicious POST destination
+// WHY: 41 POSTs to dc=1 destination = likely beaconing.
+//      Need to verify timing and payload to confirm.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+site="track.contently.com"
+| table _time, uri_path, http_user_agent, bytes_out, bytes_in, status
+| sort _time
+
+
+// Q3.2 — Calculate exact beacon intervals using delta
+// WHY: delta calculates time difference between consecutive events.
+//      Consistent intervals = automated timer = malware, not human.
+//      bytes_out constant = hardcoded packet = beacon structure.
+// RESULT: Interval = ~5 seconds. bytes_out = 305 CONSTANT x41.
+//         HTTP 201 = C2 server live and actively responding.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+site="track.contently.com"
+| sort _time
+| delta _time as time_diff p=1
+| table _time, uri_path, bytes_out, bytes_in, status, time_diff
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 4 — PYTHON MODULE ANALYSIS (Finding 3)
+// ─────────────────────────────────────────────────────────────────
+
+// Q4.1 — What was the python-requests module contacting?
+// WHY: python-requests is never produced by real browsers.
+//      Its presence confirms a Python script is running on this host.
+//      Need to identify what it was doing.
+// RESULT: Only destination = ipinfo.io, 5 GET requests.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+http_user_agent="python-requests/2.18.4"
+| stats count by site, http_method
+| sort -count
+
+
+// Q4.2 — What exact path was queried on ipinfo.io?
+// WHY: /json with no parameter = machine checking its OWN public IP.
+//      Confirms secondary beacon for IP monitoring.
+//      bytes_in constant = IP never changed during observation.
+// RESULT: /json, no uri_query. bytes_in=144 CONSTANT.
+//         Intervals: 15:15, 16:15, 17:13, 18:09, 18:54 (~60 min).
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+http_user_agent="python-requests/2.18.4"
+| table _time, uri_path, uri_query, bytes_in, bytes_out, status
+| sort _time
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 5 — SCRAPING UA VERIFICATION
+// ─────────────────────────────────────────────────────────────────
+
+// Q5.1 — Which user agent was doing the web scraping?
+// WHY: Determines which malware module is responsible for scraping.
+//      Tells us if python-requests or the spoofed Edge UA was scraping.
+// RESULT: All scraping used spoofed Edge UA (not python-requests).
+//         Confirms two independent malware modules with different roles.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+| where site IN ("www.visitcalifornia.com",
+                 "www.distillerytrail.com",
+                 "fsd.servicemax.com")
+| stats count by site, http_user_agent, http_method
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 6 — POST DATA / FINGERPRINT ANALYSIS (Finding 4)
+// ─────────────────────────────────────────────────────────────────
+
+// Q6.1 — What was submitted in POST requests to servicemax.com?
+// WHY: form_data shows the actual POST body — direct evidence of
+//      what data was being sent. Could be credential stuffing or
+//      bot detection bypass.
+// RESULT: gdbcRetrieveToken = fabricated browser fingerprint (14 attributes).
+//         bloom_handle_stats_adding = fake ad impression submitted.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+site="fsd.servicemax.com" http_method=POST
+| table _time, uri_path, form_data
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 7 — BITS DELIVERY ANALYSIS (Finding 1)
+// ─────────────────────────────────────────────────────────────────
+
+// Q7.1 — What did BITS download?
+// WHY: BITS is abused by malware to download payloads via trusted
+//      Windows service. URI path reveals exact file downloaded.
+// RESULT: PepperFlashPlayer.crx3 from Google CDN (gvt1.com).
+//         .crx3 = Chrome Extension — NOT real Flash installer format.
+//         Repeated downloads = automated persistence reinstallation.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+http_user_agent="Microsoft BITS/7.8"
+| table _time, site, dest_ip, uri_path, bytes_in, bytes_out, status
+| sort _time
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 8 — SMB DISCOVERY (Finding 7)
+// ─────────────────────────────────────────────────────────────────
+
+// Q8.1 — What SMB activity came from this host?
+// WHY: SMB from compromised host = possible lateral movement.
+//      Check dest_ip (specific machine or broadcast?),
+//      command (file access or discovery?), filename (what was accessed?).
+// RESULT: dest=192.168.3.255 (BROADCAST — not specific host).
+//         command=transaction (host enumeration, no files accessed).
+//         18 events at exact 12-minute intervals = automated timer.
+index=botsv3 sourcetype=stream:smb src_ip=192.168.3.130
+| table _time, dest_ip, command, filename, share
+| sort _time
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 9 — INTERNAL TRAFFIC CHECK (Finding 8)
+// ─────────────────────────────────────────────────────────────────
+
+// Q9.1 — Which internal IPs received traffic from this host?
+// WHY: Compromised machines often try to reach other internal hosts
+//      for lateral movement. High count to one internal IP = investigate.
+// RESULT: 192.168.3.2 received 6,821 events — suspicious volume.
+index=botsv3 sourcetype=stream:ip src_ip=192.168.3.130
+| where dest_ip LIKE "192.168.%"
+| stats count by dest_ip
+| sort -count
+
+
+// Q9.2 — Identify what machine 192.168.3.2 is
+// WHY: Must identify the target before concluding lateral movement.
+//      Could be domain controller (critical), file server, or DNS server.
+// RESULT: hostname=BTUN-L, heavy stream:dns = internal DNS server.
+index=botsv3 src_ip=192.168.3.2 OR dest_ip=192.168.3.2
+| stats count by sourcetype, host
+| sort -count
+
+
+// Q9.3 — What protocol was the traffic using?
+// WHY: TCP = active session (potential attack). UDP = connectionless
+//      (likely DNS). Protocol determines whether this is lateral movement.
+// RESULT: 100% UDP, protoid=17 = DNS. Not lateral movement.
+index=botsv3 sourcetype=stream:ip src_ip=192.168.3.130 dest_ip=192.168.3.2
+| stats count by protocol, protoid
+| sort -count
+
+
+// Q9.4 — Did 192.168.3.2 respond? (bidirectional check)
+// WHY: Symmetric traffic = interactive session. Asymmetric = query/response.
+//      DNS is asymmetric (many queries, few responses).
+// RESULT: Only 11 events back = DNS query/response. Lateral movement ruled out.
+index=botsv3 sourcetype=stream:ip src_ip=192.168.3.2
+| stats count by dest_ip
+| sort -count
+
+
+// ─────────────────────────────────────────────────────────────────
+// PHASE 10 — DNS RECONNAISSANCE (Finding 6)
+// ─────────────────────────────────────────────────────────────────
+
+// Q10.1 — Discover correct field names for stream:dns
+// WHY: stream:dns uses query{} not query (multi-value field with braces).
+//      Always run fieldsummary on a new sourcetype before querying it.
+//      Zero results from a query almost always = wrong field name.
+index=botsv3 sourcetype=stream:dns src_ip=192.168.3.130
+| fieldsummary
+| table field, count
+| where count > 0
+| sort -count
+
+
+// Q10.2 — All DNS queries from this host (top 20)
+// WHY: Every domain this machine tried to reach appears here.
+//      Anomalous volumes to internal hostnames = reconnaissance.
+//      NIMLOC queries = NetBIOS host enumeration.
+// RESULT: splunk.froth.ly=2445 (SIEM), NIMLOC=520+ (host enum),
+//         sepmserver=750+ (AV server), wpad=361+ (proxy discovery).
+index=botsv3 sourcetype=stream:dns src_ip=192.168.3.130
+| stats count by "query{}", "query_type{}"
+| sort -count
+| head 20
+
+
+// Q10.3 — What IPs did domains resolve to?
+// WHY: Confirms which IP each domain resolves to.
+//      Cross-reference with HTTP destinations to build evidence chain:
+//      DNS query → IP → HTTP connection.
+// RESULT: splunk.froth.ly → 34.215.24.225 (AWS) = SIEM on cloud.
+index=botsv3 sourcetype=stream:dns src_ip=192.168.3.130
+| stats count by "query{}", "host_addr{}"
+| sort -count
+| head 20
+
+
+// ─────────────────────────────────────────────────────────────────
+// UTILITY QUERIES
+// ─────────────────────────────────────────────────────────────────
+
+// U1 — Field name discovery for any sourcetype
+// Use when a query returns 0 results despite events existing.
+// Replace sourcetype with whichever you are investigating.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+| fieldsummary
+| table field, count, distinct_count
+| where count > 0
+| sort -count
+
+
+// U2 — Detect beaconing patterns across all destinations
+// Finds any destination being hit repeatedly at regular intervals.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+| bin _time span=1m
+| stats count by _time, site, uri_path
+| where count >= 2
+| sort _time, site
+
+
+// U3 — Data volume analysis per destination
+// Detects potential exfiltration: high mb_out to unknown external IPs.
+index=botsv3 sourcetype=stream:http src_ip=192.168.3.130
+| stats sum(bytes_out) as total_bytes_out,
+        sum(bytes_in) as total_bytes_in,
+        count as requests
+  by site, dest_ip
+| eval mb_out=round(total_bytes_out/1048576, 2)
+| eval mb_in=round(total_bytes_in/1048576, 2)
+| sort -mb_out
+| table site, dest_ip, requests, mb_out, mb_in
